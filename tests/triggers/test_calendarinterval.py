@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
@@ -7,6 +8,25 @@ import pytest
 
 from apscheduler.abc import Serializer
 from apscheduler.triggers.calendarinterval import CalendarIntervalTrigger
+
+
+def _next_with_deadline(
+    trigger: CalendarIntervalTrigger, seconds: float = 5.0
+) -> datetime | None:
+    """Interrupt a runaway trigger instead of hanging the whole test suite."""
+    if not hasattr(signal, "setitimer"):
+        return trigger.next()
+
+    def raise_timeout(signum: int, frame: object) -> None:
+        raise TimeoutError(f"trigger.next() did not terminate within {seconds}s")
+
+    previous_handler = signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return trigger.next()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def test_bad_interval(timezone):
@@ -37,6 +57,41 @@ def test_end_date(timezone, serializer):
 
     assert trigger.next().date() == start_end_date
     assert trigger.next() is None
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [
+        pytest.param({"years": 1}, id="years"),
+        pytest.param({"months": 1}, id="months"),
+        pytest.param({"weeks": 1}, id="weeks"),
+        pytest.param({"days": 1}, id="days"),
+    ],
+)
+def test_start_date_at_max_year(timezone, interval: dict[str, int]) -> None:
+    """Exhausted intervals return None, per the Trigger.next() contract."""
+    start_date = date(9999, 12, 31)
+    trigger = CalendarIntervalTrigger(
+        start_date=start_date, timezone=timezone, **interval
+    )
+
+    assert trigger.next() == datetime.combine(start_date, time(0, 0), timezone)
+    assert _next_with_deadline(trigger) is None
+
+
+def test_interval_before_max_year(timezone) -> None:
+    """Normal intervals are unchanged by the maximum-year guard."""
+    trigger = CalendarIntervalTrigger(
+        days=1,
+        start_date=date(2024, 2, 28),
+        end_date=date(2024, 3, 1),
+        timezone=timezone,
+    )
+    assert [fire.date() for fire in trigger] == [
+        date(2024, 2, 28),
+        date(2024, 2, 29),
+        date(2024, 3, 1),
+    ]
 
 
 def test_missing_time(timezone, serializer):
